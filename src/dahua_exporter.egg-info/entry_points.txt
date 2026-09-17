@@ -1,0 +1,2 @@
+[console_scripts]
+dahua-exporter = dahua_exporter.gui:main

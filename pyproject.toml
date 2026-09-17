@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dahua-exporter"
+version = "0.4.0"
+description = "Export recordings from Dahua NVR/DVR and IP cameras"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Developer", email = "dev@example.com"}
+]
+
+dependencies = [
+    "PySide6>=6.5.0",
+    "requests>=2.28.0",
+    "pydantic>=2.0.0",
+    "keyring>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-qt>=4.2.0",
+    "ruff>=0.1.0",
+    "build>=1.0.0",
+]
+
+[project.scripts]
+dahua-exporter = "dahua_exporter.gui:main"
+
+[tool.setuptools]
+packages = ["dahua_exporter"]
+package-dir = {"" = "src"}
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
