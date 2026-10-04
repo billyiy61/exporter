@@ -196,6 +196,26 @@ class LoginDialog(QDialog):
         super().closeEvent(event)
 
 
+def _api_path(raw: str) -> str:
+    """
+    Приводит путь от API Яндекс.Диска к виду, который принимает API.
+
+    Проблема: в ответах API пути приходят с префиксом ресурса —
+    "disk:/Папка/Вложенная". Если такой путь отправить обратно в
+    параметре path, Яндекс ответит 404, потому что рабочая форма —
+    "/Папка/Вложенная".
+
+    Поэтому префикс "disk:" (и любые другие вида "<ресурс>:") срезаем.
+    """
+    if not raw:
+        return "/"
+    if ":" in raw:
+        raw = raw.split(":", 1)[1]
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    return raw
+
+
 # --------------------------------------------------------------------------
 # Браузер папок Яндекс.Диска
 # --------------------------------------------------------------------------
@@ -285,7 +305,11 @@ class FolderPickerDialog(QDialog):
             if not it.is_dir:
                 continue   # показываем только папки
             item = QListWidgetItem(f"📁  {it.name}")
-            item.setData(Qt.UserRole, it.path)
+            # Яндекс отдаёт путь с префиксом "disk:", например
+            # "disk:/DahuaExporter". Для запросов нужен чистый путь
+            # "/DahuaExporter". Без нормализации следующий поиск уходил
+            # на "disk:/DahuaExporter" и падал с ошибкой 404.
+            item.setData(Qt.UserRole, _api_path(it.path))
             self.list.addItem(item)
 
         self.info.setStyleSheet(f"color: {theme.TEXT_MUTE}; font-size: 11px;")

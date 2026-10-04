@@ -246,6 +246,20 @@ class Database:
             self._conn.execute(f"UPDATE uploads SET {sets} WHERE id = ?", vals)
             self._conn.commit()
 
+    def get_upload(self, upload_id: int) -> UploadRecord | None:
+        """
+        Одна запись истории по её номеру.
+
+        Нужна кнопке «Повторить»: чтобы залить файл заново в ту же
+        папку облака, надо знать путь, которым закончилась прошлая
+        попытка. Возвращает None, если записи нет.
+        """
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM uploads WHERE id = ?", (upload_id,)
+            ).fetchone()
+        return self._row_to_upload(r) if r else None
+
     def list_uploads(self, limit: int = 200) -> list[UploadRecord]:
         with self._lock:
             rows = self._conn.execute("""

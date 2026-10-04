@@ -16,7 +16,7 @@ import os
 import threading
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateTimeEdit, QFileDialog,
@@ -695,6 +695,19 @@ class MainWindow(QWidget):
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._on_cancel)
         row_btn.addWidget(self.cancel_btn)
+
+        # «Повторить» появляется, только если загрузка в облако упала.
+        # Позволяет взять уже скачанный файл с диска (или выбрать другой)
+        # и залить заново, НЕ скачивая запись с регистратора повторно.
+        self.retry_btn = QPushButton("Повторить загрузку")
+        self.retry_btn.setObjectName("primary")
+        self.retry_btn.setMinimumHeight(42)
+        self.retry_btn.setVisible(False)
+        self.retry_btn.setToolTip(
+            "Загрузить в облако ещё раз, не скачивая запись заново"
+        )
+        self.retry_btn.clicked.connect(self._on_retry_upload)
+        row_btn.addWidget(self.retry_btn)
         prog_card.body.addLayout(row_btn)
 
         self.log_lbl = QLabel("Готов к выгрузке.")
@@ -1094,8 +1107,15 @@ class MainWindow(QWidget):
 
         client, cloud_path = getattr(self, "_pending_cloud", (None, None))
         if client is None or not cloud_path:
+            # облако не запрашивали — просто скачали файл
             self._finish_export_ui("готово")
             return
+
+        # активный аккаунт нужен для записи в историю
+        try:
+            account_id, _ = self.cloud_tab.get_active_client()
+        except Exception:                            # noqa: BLE001
+            account_id = None
 
         # этап 2 — загрузка в облако
         self.log_lbl.setText(
@@ -1105,16 +1125,9 @@ class MainWindow(QWidget):
             self.db.update_upload(self.last_upload_id,
                                   upload_state="uploading")
 
-        self.upload_worker = UploadWorker(
-            client, path, cloud_path, self.last_upload_id or 0
-        )
-        self.upload_worker.progress.connect(
-            lambda p: self.progress_cloud.setValue(int(p * 100))
-        )
-        self.upload_worker.done.connect(self._on_upload_done)
-        self.upload_worker.failed.connect(self._on_upload_failed)
-        self.upload_worker.cancelled.connect(self._on_upload_cancelled)
-        self.upload_worker.start()
+        # Запуск заливки — через общий метод, тот же, что у кнопки
+        # «Повторить». Так логика загрузки живёт в одном месте.
+        self._start_cloud_upload(client, account_id, path, cloud_path)
 
     def _on_upload_done(self, upload_id: int, cloud_path: str, size: int) -> None:
         self.progress_cloud.setValue(100)
@@ -1130,7 +1143,29 @@ class MainWindow(QWidget):
             self.cloud_tab.refresh_all()
         except Exception:                            # noqa: BLE001
             pass
+
+        self.retry_btn.setVisible(False)
+
+        # Даём прогнозу постоять на 100% и показываем итог пользователю.
+        # Раньше об успехе говорила только мелкая строка внизу —
+        # легко было не заметить.
+        self.log_lbl.setStyleSheet(f"color: {theme.SUCCESS};")
+        self.log_lbl.setText(
+            f"Загружено в облако: {os.path.basename(cloud_path)}"
+        )
         self._finish_export_ui("готово")
+
+        QMessageBox.information(
+            self, "Загрузка завершена",
+            f"Видео успешно загружено в Яндекс.Диск.\n\n"
+            f"Файл: {os.path.basename(cloud_path)}\n"
+            f"Размер: {size / 1024 / 1024:.1f} МБ\n"
+            f"Папка: {cloud_path.rsplit('/', 1)[0] or '/'}"
+        )
+
+        # Гасим прогрессы ПОСЛЕ закрытия окна: если сбросить раньше,
+        # пользователь увидит пустые полосы за спиной у сообщения.
+        QTimer.singleShot(400, self._reset_progress_bars)
 
     def _on_upload_failed(self, upload_id: int, msg: str) -> None:
         if self.db is not None and upload_id:
@@ -1143,7 +1178,23 @@ class MainWindow(QWidget):
             "Файл скачан, но в облако не залился.\n" + msg
         )
         self._finish_export_ui("ошибка загрузки в облако")
-        QMessageBox.warning(self, "Облако", msg)
+
+        # Файл уже на диске — показываем кнопку повтора, чтобы не
+        # скачивать запись с регистратора заново
+        self.retry_btn.setVisible(True)
+        self.export_btn.setEnabled(True)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Загрузка в облако не удалась")
+        box.setText("Файл скачан на компьютер, но в облако не залился.")
+        box.setInformativeText(msg)
+        retry = box.addButton("Повторить", QMessageBox.AcceptRole)
+        box.addButton("Закрыть", QMessageBox.RejectRole)
+        box.exec()
+
+        if box.clickedButton() is retry:
+            self._on_retry_upload()
 
     def _on_upload_cancelled(self, upload_id: int) -> None:
         if self.db is not None and upload_id:
@@ -1155,6 +1206,186 @@ class MainWindow(QWidget):
             "Загрузка в облако отменена. Локальный файл остался на диске."
         )
         self._finish_export_ui("отменено")
+
+    def _reset_progress_bars(self) -> None:
+        """Обнуляет оба прогресса и возвращает подписи в исходный вид."""
+        self.progress_nvr.setValue(0)
+        self.progress_cloud.setValue(0)
+        self.nvr_lbl.setStyleSheet(
+            f"color: {theme.TEXT_DIM}; font-size: 11px;"
+        )
+        self.cloud_lbl.setStyleSheet(
+            f"color: {theme.TEXT_DIM}; font-size: 11px;"
+        )
+        self.nvr_lbl.setText("Скачивание с регистратора")
+        self.cloud_lbl.setText("Загрузка в облако")
+
+    # ---------- повторная загрузка в облако ----------
+
+    def _on_retry_upload(self) -> None:
+        """
+        Повтор загрузки в облако БЕЗ нового скачивания с регистратора.
+
+        Зачем: если запись уже лежит на диске, гонять её с камеры
+        повторно бессмысленно — это минуты ожидания и нагрузка на
+        регистратор. Берём готовый файл и заливаем заново.
+
+        Предлагаем на выбор:
+          * уже скачанный файл (если он на месте)
+          * любой другой файл с диска
+        """
+        client, account_id, cloud_path = self._retry_context()
+        if client is None:
+            return
+
+        # Предлагаем локальный файл, если он ещё существует
+        local = self.last_local_file
+        if local and not os.path.exists(local):
+            local = None
+
+        if local:
+            ans = QMessageBox.question(
+                self, "Повторить загрузку",
+                f"Загрузить в облако ещё раз?\n\n"
+                f"Файл: {os.path.basename(local)}\n"
+                f"Скачивать с регистратора заново НЕ нужно.\n\n"
+                f"«Нет» — выбрать другой файл на компьютере.",
+            )
+            if ans == QMessageBox.Yes:
+                self._start_cloud_upload(client, account_id, local, cloud_path)
+                return
+
+        # Выбор файла вручную
+        start_dir = os.path.dirname(local) if local else (
+            self.cfg.last_out_dir or os.path.expanduser("~")
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Какой файл загрузить в облако", start_dir,
+            "Видео MP4 (*.mp4);;Все файлы (*)",
+        )
+        if not path:
+            return
+
+        # Имя в облаке берём по выбранному файлу, папку оставляем прежнюю
+        folder = cloud_path.rsplit("/", 1)[0] if cloud_path else ""
+        if not folder:
+            folder = self.folder_selector.path().rstrip("/") or "/DahuaExporter"
+        target = f"{folder}/{os.path.basename(path)}"
+
+        self._start_cloud_upload(client, account_id, path, target)
+
+    def _retry_context(self):
+        """
+        Собирает всё нужное для повтора: клиент, аккаунт, путь в облаке.
+
+        Возвращает (None, None, None), если повторить невозможно, —
+        и объясняет причину пользователю.
+        """
+        if self.db is None:
+            QMessageBox.warning(
+                self, "Повтор невозможен",
+                "База данных не открыта, история загрузок недоступна."
+            )
+            return None, None, None
+
+        try:
+            account_id, client = self.cloud_tab.get_active_client()
+        except Exception:                            # noqa: BLE001
+            account_id, client = None, None
+
+        if client is None or account_id is None:
+            QMessageBox.warning(
+                self, "Повтор невозможен",
+                "Нет активного аккаунта Яндекс.Диска.\n"
+                "Войди в аккаунт на вкладке «Аккаунты»."
+            )
+            return None, None, None
+
+        # Путь в облаке берём из последней попытки
+        cloud_path = ""
+        if self.last_upload_id:
+            try:
+                rec = self.db.get_upload(self.last_upload_id)
+                if rec:
+                    cloud_path = rec.cloud_path or ""
+            except Exception:                        # noqa: BLE001
+                cloud_path = ""
+
+        if not cloud_path:
+            folder = self.folder_selector.path().rstrip("/") or "/DahuaExporter"
+            local_name = os.path.basename(self.last_local_file or "")
+            cloud_path = f"{folder}/{local_name}" if local_name else ""
+
+        return client, account_id, cloud_path
+
+    def _start_cloud_upload(self, client, account_id: int,
+                            local_path: str, cloud_path: str) -> None:
+        """Общая точка запуска заливки в облако (и для повтора тоже)."""
+        if not cloud_path:
+            QMessageBox.warning(
+                self, "Повтор невозможен",
+                "Не удалось определить папку на Яндекс.Диске."
+            )
+            return
+
+        if not os.path.exists(local_path):
+            QMessageBox.warning(
+                self, "Файл не найден",
+                f"Локальный файл недоступен:\n{local_path}\n\n"
+                f"Скачай запись заново или выбери другой файл."
+            )
+            return
+
+        size = os.path.getsize(local_path)
+        if size == 0:
+            QMessageBox.warning(
+                self, "Файл пустой",
+                "Выбранный файл имеет нулевой размер — загружать нечего."
+            )
+            return
+
+        # История: если прежней записи нет (например, заливаем сторонний
+        # файл) — заводим новую строку, чтобы загрузка не потерялась.
+        upload_id = self.last_upload_id
+        if upload_id is None:
+            upload_id = self.db.add_upload(
+                account_id=account_id,
+                device_host=self.host_edit.text().strip(),
+                channel=int(self.export_channel.currentData() or 0),
+                channel_name=self.export_channel.currentText(),
+                rec_start="", rec_end="",
+                local_path=local_path,
+                cloud_path=cloud_path,
+            )
+            self.last_upload_id = upload_id
+
+        self.last_local_file = local_path
+        self.retry_btn.setVisible(False)
+        self.export_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText("Отменить")
+        self.progress_cloud.setValue(0)
+
+        self.db.update_upload(upload_id, upload_state="uploading",
+                              cloud_path=cloud_path,
+                              local_path=local_path, local_size=size)
+
+        self._update_status("busy", "загрузка в облако…")
+        self.log_lbl.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        self.log_lbl.setText(
+            f"Загружаю в облако: {os.path.basename(local_path)}"
+        )
+
+        self.upload_worker = UploadWorker(
+            client, local_path, cloud_path, upload_id or 0
+        )
+        self.upload_worker.progress.connect(
+            lambda p: self.progress_cloud.setValue(int(p * 100))
+        )
+        self.upload_worker.done.connect(self._on_upload_done)
+        self.upload_worker.failed.connect(self._on_upload_failed)
+        self.upload_worker.cancelled.connect(self._on_upload_cancelled)
+        self.upload_worker.start()
 
     def _finish_export_ui(self, status_text: str) -> None:
         self.export_btn.setEnabled(True)
